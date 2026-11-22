@@ -1,6 +1,7 @@
-import { Injectable, UnauthorizedException } from '@nestjs/common';
+import { Injectable, Logger, UnauthorizedException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { InMemoryTokenStore, TokenStore } from '../tokens/token-store';
+import { TtlCache } from '../common/cache/ttl-cache';
 
 const GITHUB_AUTHORIZE_URL = 'https://github.com/login/oauth/authorize';
 const GITHUB_TOKEN_URL = 'https://github.com/login/oauth/access_token';
@@ -39,6 +40,9 @@ export interface GithubRepo {
  */
 @Injectable()
 export class GithubService {
+  private readonly logger = new Logger(GithubService.name);
+  private readonly cache = new TtlCache<any>();
+
   /** STUB: userId tạm thời. Sau này lấy từ session/token của Identity service. */
   private readonly demoUserId = 'demo-user';
 
@@ -116,12 +120,21 @@ export class GithubService {
   }
 
   async getCurrentUser(): Promise<GithubUser> {
+    const cacheKey = `github:user:${this.demoUserId}`;
+    const cached = this.cache.get(cacheKey);
+    if (cached) {
+      this.logger.log(`cache hit ${cacheKey}`);
+      return cached as GithubUser;
+    }
+
     const token = await this.requireToken();
     const res = await fetch(`${GITHUB_API_BASE}/user`, {
       headers: { Authorization: `Bearer ${token}`, Accept: 'application/vnd.github+json' },
     });
     if (!res.ok) throw new UnauthorizedException(`GitHub API lỗi HTTP ${res.status}`);
-    return (await res.json()) as GithubUser;
+    const user = (await res.json()) as GithubUser;
+    this.cache.set(cacheKey, user, 5 * 60 * 1000); // 5 phút
+    return user;
   }
 
   /**
@@ -129,6 +142,13 @@ export class GithubService {
    * GitHub phân trang 100 repo/trang nên phải đi hết các trang.
    */
   async listAllRepos(): Promise<GithubRepo[]> {
+    const cacheKey = `github:repos:${this.demoUserId}`;
+    const cached = this.cache.get(cacheKey);
+    if (cached) {
+      this.logger.log(`cache hit ${cacheKey}`);
+      return cached as GithubRepo[];
+    }
+
     const token = await this.requireToken();
     const all: GithubRepo[] = [];
     let page = 1;
@@ -145,6 +165,7 @@ export class GithubService {
       if (repos.length < 100) break;
       page += 1;
     }
+    this.cache.set(cacheKey, all, 60 * 1000); // 60s
     return all;
   }
 

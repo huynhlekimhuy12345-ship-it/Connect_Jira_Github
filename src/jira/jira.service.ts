@@ -1,10 +1,12 @@
 import {
   ForbiddenException,
   Injectable,
+  Logger,
   UnauthorizedException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { InMemoryTokenStore, TokenStore } from '../tokens/token-store';
+import { TtlCache } from '../common/cache/ttl-cache';
 
 const JIRA_AUTHORIZE_URL = 'https://auth.atlassian.com/authorize';
 const JIRA_TOKEN_URL = 'https://auth.atlassian.com/oauth/token';
@@ -50,6 +52,9 @@ export interface JiraProjectSummary {
  */
 @Injectable()
 export class JiraService {
+  private readonly logger = new Logger(JiraService.name);
+  private readonly cache = new TtlCache<any>();
+
   /** STUB: userId tạm thời. Sau này lấy từ session/token của Identity service. */
   private readonly demoUserId = 'demo-user';
 
@@ -183,13 +188,31 @@ export class JiraService {
   }
 
   async getCurrentUser(): Promise<JiraUser> {
+    const cacheKey = `jira:user:${this.demoUserId}`;
+    const cached = this.cache.get(cacheKey);
+    if (cached) {
+      this.logger.log(`cache hit ${cacheKey}`);
+      return cached as JiraUser;
+    }
+
     const { accessToken, cloudId } = await this.requireTokens();
-    return this.jiraFetch<JiraUser>(cloudId, accessToken, '/myself');
+    const user = await this.jiraFetch<JiraUser>(cloudId, accessToken, '/myself');
+    this.cache.set(cacheKey, user, 5 * 60 * 1000); // 5 phút
+    return user;
   }
 
   async listProjects(): Promise<JiraProjectSummary[]> {
+    const cacheKey = 'jira:projects';
+    const cached = this.cache.get(cacheKey);
+    if (cached) {
+      this.logger.log(`cache hit ${cacheKey}`);
+      return cached as JiraProjectSummary[];
+    }
+
     const { accessToken, cloudId } = await this.requireTokens();
-    return this.jiraFetch<JiraProjectSummary[]>(cloudId, accessToken, '/project');
+    const projects = await this.jiraFetch<JiraProjectSummary[]>(cloudId, accessToken, '/project');
+    this.cache.set(cacheKey, projects, 5 * 60 * 1000); // 5 phút
+    return projects;
   }
 
   /**
@@ -198,6 +221,13 @@ export class JiraService {
    * trạng thái theo từng issue (vd NEX-1024) lên thẻ tin nhắn.
    */
   async searchIssues(jql: string): Promise<JiraIssueSummary[]> {
+    const cacheKey = `jira:issues:${jql}`;
+    const cached = this.cache.get(cacheKey);
+    if (cached) {
+      this.logger.log(`cache hit ${cacheKey}`);
+      return cached as JiraIssueSummary[];
+    }
+
     const { accessToken, cloudId, siteUrl } = await this.requireTokens();
     const data = await this.jiraFetch<{
       issues: Array<{
@@ -217,7 +247,7 @@ export class JiraService {
         maxResults: 50,
       }),
     });
-    return data.issues.map((issue) => ({
+    const result = data.issues.map((issue) => ({
       key: issue.key,
       summary: issue.fields.summary,
       status: issue.fields.status.name,
@@ -225,6 +255,8 @@ export class JiraService {
       updated: issue.fields.updated,
       url: `${siteUrl}/browse/${issue.key}`,
     }));
+    this.cache.set(cacheKey, result, 30 * 1000); // 30s
+    return result;
   }
 
   /**

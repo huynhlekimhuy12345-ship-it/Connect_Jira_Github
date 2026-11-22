@@ -1,8 +1,11 @@
-import { Controller, Headers, Post, Req, UnauthorizedException } from '@nestjs/common';
+import { Controller, Headers, Logger, Post, Req, UnauthorizedException } from '@nestjs/common';
 import type { Request } from 'express';
 import { ConfigService } from '@nestjs/config';
+import { createHash } from 'node:crypto';
 import { getRawBody, verifyHmacSha256 } from '../common/crypto/verify-signature';
 import { WebhooksService } from './webhooks.service';
+import { DeliveryDedup } from './delivery-dedup';
+import { WebhookQueue } from './webhook-queue';
 
 /**
  * Receiver webhook GitHub + Jira.
@@ -32,9 +35,13 @@ import { WebhooksService } from './webhooks.service';
  */
 @Controller('integrations')
 export class WebhooksController {
+  private readonly logger = new Logger(WebhooksController.name);
+
   constructor(
     private readonly config: ConfigService,
     private readonly webhooks: WebhooksService,
+    private readonly dedup: DeliveryDedup,
+    private readonly queue: WebhookQueue,
   ) {}
 
   @Post('github/webhooks')
@@ -51,15 +58,28 @@ export class WebhooksController {
         'Chữ ký webhook GitHub không hợp lệ (thiếu X-Hub-Signature-256, sai secret, hoặc secret chưa cấu hình).',
       );
     }
+
+    const dedupKey = deliveryId
+      ? `github:${deliveryId}`
+      : `github:${createHash('sha256').update(rawBody).digest('hex')}`;
+
+    if (this.dedup.isDuplicate(dedupKey)) {
+      this.logger.warn(`Bỏ qua webhook GitHub trùng: ${dedupKey}`);
+      return { received: true, duplicate: true, projectedCard: null };
+    }
+
     const payload = JSON.parse(rawBody.toString('utf8')) as any;
     const action = payload?.action as string | undefined;
-    const card = this.webhooks.handleGithubEvent(event ?? '', action, payload);
+
+    this.queue.enqueue(dedupKey, () => {
+      const card = this.webhooks.handleGithubEvent(event ?? '', action, payload);
+      this.logger.log(`Projected card (GitHub): ${JSON.stringify(card)}`);
+    });
+
     return {
       received: true,
+      queued: true,
       deliveryId: deliveryId ?? null,
-      event: event ?? null,
-      action: action ?? null,
-      projectedCard: card,
     };
   }
 
@@ -74,8 +94,6 @@ export class WebhooksController {
     if (!rawBody) {
       throw new UnauthorizedException('Không đọc được body webhook Jira.');
     }
-    const payload = JSON.parse(rawBody.toString('utf8')) as any;
-    const webhookEvent = payload?.webhookEvent as string | undefined;
 
     // Đường 1 — webhook admin có secret: xác thực HMAC như GitHub.
     if (signature) {
@@ -99,7 +117,24 @@ export class WebhooksController {
       );
     }
 
-    const card = this.webhooks.handleJiraEvent(webhookEvent, payload);
-    return { received: true, webhookEvent: webhookEvent ?? null, projectedCard: card };
+    const dedupKey = `jira:${createHash('sha256').update(rawBody).digest('hex')}`;
+    if (this.dedup.isDuplicate(dedupKey)) {
+      this.logger.warn(`Bỏ qua webhook Jira trùng: ${dedupKey}`);
+      return { received: true, duplicate: true, projectedCard: null };
+    }
+
+    const payload = JSON.parse(rawBody.toString('utf8')) as any;
+    const webhookEvent = payload?.webhookEvent as string | undefined;
+
+    this.queue.enqueue(dedupKey, () => {
+      const card = this.webhooks.handleJiraEvent(webhookEvent, payload);
+      this.logger.log(`Projected card (Jira): ${JSON.stringify(card)}`);
+    });
+
+    return {
+      received: true,
+      queued: true,
+      webhookEvent: webhookEvent ?? null,
+    };
   }
 }

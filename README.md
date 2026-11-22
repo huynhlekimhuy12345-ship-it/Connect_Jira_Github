@@ -134,12 +134,25 @@ curl "http://localhost:3003/integrations/jira/issues?jql=project%3DNEX%20AND%20s
 curl http://localhost:3003/workspaces/nexus/integrations/status
 
 # 6. Giả lập webhook GitHub (cần GITHUB_WEBHOOK_SECRET trong .env)
-#    Tính chữ ký: SIG=$(printf '%s' '{"action":"opened"}' | openssl dgst -sha256 -hmac "$GITHUB_WEBHOOK_SECRET" | cut -d' ' -f2)
-#    curl -X POST http://localhost:3003/integrations/github/webhooks \
-#      -H "Content-Type: application/json" \
-#      -H "X-GitHub-Event: pull_request" \
-#      -H "X-Hub-Signature-256: sha256=$SIG" \
-#      -d '{"action":"opened","pull_request":{"id":1,"title":"test","state":"open","html_url":"https://github.com/x/y/pull/1","user":{"login":"huy"},"updated_at":"2026-11-20T00:00:00Z"},"repository":{"full_name":"x/y"}}'
+#    Lưu ý: Phải tính chữ ký HMAC trên ĐÚNG payload JSON gửi đi:
+BODY='{"action":"opened","pull_request":{"id":1,"title":"test","state":"open","html_url":"https://github.com/x/y/pull/1","user":{"login":"huy"},"updated_at":"2026-11-20T00:00:00Z"},"repository":{"full_name":"x/y"}}'
+SIG=$(printf '%s' "$BODY" | openssl dgst -sha256 -hmac "$GITHUB_WEBHOOK_SECRET" | cut -d' ' -f2)
+
+# Lần 1: Nhận webhook và đưa vào queue (HTTP 201 {"received":true,"queued":true,"deliveryId":"deliv-1"}, projectedCard ghi trong log service)
+curl -X POST http://localhost:3003/integrations/github/webhooks \
+  -H "Content-Type: application/json" \
+  -H "X-GitHub-Event: pull_request" \
+  -H "X-GitHub-Delivery: deliv-1" \
+  -H "X-Hub-Signature-256: sha256=$SIG" \
+  -d "$BODY"
+
+# Lần 2 (test dedupe): Gửi lại cùng deliveryId / payload -> Trả ngay 201 {"received":true,"duplicate":true,"projectedCard":null}
+curl -X POST http://localhost:3003/integrations/github/webhooks \
+  -H "Content-Type: application/json" \
+  -H "X-GitHub-Event: pull_request" \
+  -H "X-GitHub-Delivery: deliv-1" \
+  -H "X-Hub-Signature-256: sha256=$SIG" \
+  -d "$BODY"
 
 # 7. Ghi trạng thái sang Jira — MẶC ĐỊNH TRẢ 403 (chưa bật JIRA_WRITEBACK_ENABLED)
 curl -X POST http://localhost:3003/integrations/jira/issues/NEX-1024/status \
@@ -164,20 +177,25 @@ webhook URL.
 4. **Verify JWT webhook động Jira chưa xong** (mục 5) — dùng webhook admin
    kèm secret trước.
 5. **Chưa refresh webhook động Jira** (hết hạn sau 30 ngày) — cần job định kì.
-6. **Chưa chống xử lý trùng webhook** (GitHub gửi trùng khi retry):
-   cần ghi `X-GitHub-Delivery` / `webhookEventId` và bỏ qua delivery đã xử lý.
-7. **Chưa có queue**: webhook handler phải trả 2xx nhanh; việc nặng phải
-   đưa vào queue (theo phân công team: queue trước, Kafka sau).
-8. **User demo cố định** (`demo-user`): mọi token đang gắn với 1 user giả.
+6. **ĐÃ XONG — Chống xử lý trùng webhook (dedupe)**: Đã triển khai `DeliveryDedup`
+   in-memory (Map, TTL 24h, tối đa 10.000 key). Giới hạn: lưu trong bộ nhớ tạm,
+   mất khi restart (sẽ chuyển sang Redis sau).
+7. **ĐÃ XONG — Hàng đợi webhook (queue)**: Đã triển khai `WebhookQueue` in-memory
+   xử lý tuần tự, worker chạy nền, retry 5 lần [5s, 10s, 20s, 40s, 80s].
+   Giới hạn: in-memory, mất khi restart (sẽ chuyển sang Kafka sau).
+8. **ĐÃ XONG — Cache API đọc**: Đã triển khai `TtlCache` in-memory cho các API đọc
+   (listAllRepos 60s, getCurrentUser 5m, listProjects 5m, searchIssues 30s).
+   Giới hạn: in-memory, mất khi restart.
+9. **User demo cố định** (`demo-user`): mọi token đang gắn với 1 user giả.
    Sau này lấy userId từ session/token của Identity service.
-9. **Chưa gắn bảng liên kết workspace ↔ tài khoản**: endpoint
-   `GET /workspaces/{id}/integrations/status` hiện trả trạng thái của user
-   demo, chưa theo từng workspace thật.
-10. **Ghi trạng thái sang Jira đang TẮT** — cần team xác nhận (mục 0).
+10. **Chưa gắn bảng liên kết workspace ↔ tài khoản**: endpoint
+    `GET /workspaces/{id}/integrations/status` hiện trả trạng thái của user
+    demo, chưa theo từng workspace thật.
+11. **Ghi trạng thái sang Jira đang TẮT** — cần team xác nhận (mục 0).
 
 ## 8. Luật push
 
-**KHÔNG commit/push gì vào repo Nexus từ khung này.** Huy copy thư mục
-`nexus-integration-service` vào `backend/domains/external-integration/` trong
-clone local của mình, tự kiểm tra rồi tự push theo luật team (demo board trước,
-CI xanh, update issue, In Review, comment link commit, Done).
+**KHÔNG commit/push gì vào repo Nexus từ khung này.** Code service này hiện đã có repo
+riêng: `Connect_Jira_Github` (https://github.com/huynhlekimhuy12345-ship-it/Connect_Jira_Github).
+Việc copy sang repo Nexus (`backend/domains/external-integration/`) sẽ được thực hiện
+từ repo này sau khi hoàn tất kiểm tra theo luật team (demo board trước, CI xanh, update issue, In Review, comment link commit, Done).
